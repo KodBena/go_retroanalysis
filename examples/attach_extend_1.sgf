@@ -1,0 +1,17 @@
+(;GM[1]FF[4]CA[UTF-8]AP[CGoban:3]ST[2]
+RU[Japanese]SZ[19]KM[7.00]
+PW[White]PB[Black]AW[fp]AB[cp][ep][fq]C[{
+  "avoid": {
+    "B": {
+      "rects": [["A1", 8, 6\]\],
+      "depth": 18
+    },
+    "W": {
+      "rects": [["A1", 8, 6\]\],
+      "depth": 18
+    }
+  },
+  "player": "W",
+  "ref": ["G3"\],
+  "comp": "G4"
+}])
