@@ -321,7 +321,7 @@ class Node:
                 denominator = 1
             else:
                 node = self[child]
-                mu = node.q_value / (1 + tabooed_visits)
+                mu = node.q_value / (1 + node.get_tabooed_visits())
                 denominator = 1 + node.visits
             return (mu,denominator)
         return [(child, arf(child)) for child in self.children if child not in self.taboo_list ]
