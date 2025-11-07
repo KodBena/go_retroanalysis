@@ -44,3 +44,5 @@ def uct(self_visits, child_keys_and_values):
     lst_filtered = [ x[0] for x in lst if x[1] == m]
     child = lst_filtered[np.random.choice(len(lst_filtered))]
     return child
+import time
+timestamp = lambda: time.clock_gettime(time.CLOCK_REALTIME)
