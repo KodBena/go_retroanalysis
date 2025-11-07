@@ -6,8 +6,8 @@ class TreePolicyException(Exception):
     pass
 class BorkException(Exception):
     pass
-K_BUDGET=4
-D_BUDGET=40
+K_BUDGET=15
+D_BUDGET=35
 ROOT_VISITS=6400
 TERMINAL_VISITS=1600
 CANDIDATE_VISITS=40
