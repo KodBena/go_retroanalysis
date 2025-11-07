@@ -64,7 +64,7 @@ def test_initial_condition(query):
 from node import *
 
 def mk_root_node(initial_query, xdata,board):
-    node = Node(xdata,board, 'root',parent=None, parent_query = initial_query, action=None)
+    node = Node(board, 'root',parent=None, parent_query = initial_query, action=None,xdata=xdata)
     node.forbidden_vertices = mk_forbidden_vertices(initial_query)
     node.balance = xdata['initial_counts']
     return node
