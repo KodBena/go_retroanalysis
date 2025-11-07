@@ -6,100 +6,125 @@ class TreePolicyException(Exception):
     pass
 class BorkException(Exception):
     pass
-K_BUDGET=15
-D_BUDGET=35
+K_BUDGET=4
+D_BUDGET=40
+ROOT_VISITS=6400
+TERMINAL_VISITS=1600
+CANDIDATE_VISITS=40
+OUTCOME_PVLEN=8
+CANDIDATE_PVLEN=8
+LOSS_THRESHOLD = 0.3    # how bad of a move we accept to search, in point loss vs preferred move
+
+
+visit_weight = 0.3
+winrate_weight = 1.0-visit_weight
+soft_outcome_weight = 0.2
+hard_outcome_weight = 1.0 - soft_outcome_weight
+winrate_lambda = 0.8
+
 from copy import deepcopy
 from functools import lru_cache,cached_property
-from util import top_k,mkid,uct,random_key,xchg_color,_list_oc
+from util import top_k,mkid,uct,random_key,xchg_color,_list_oc,timestamp,parity_player
 from sgfmill.common import move_from_vertex as mvv
-from sgfmill import boards
-from sgfmill import sgf
+from sgfmill import boards,sgf
 import numpy as np
 default_policy_stats = dict(tries=0, success = 0)
 bests = [dict(num_best=0,node=None,value=0)]
 solutions = [dict(num_solution=0,node=None,value=0)]
 from collections import defaultdict, deque
-import time
-timestamp = lambda: time.clock_gettime(time.CLOCK_REALTIME)
 
 now = timestamp()
-leaf_statistics = dict(count=0,last=now, first=now)
+leaf_statistics = dict(count=0,last_histo=now, last_tree=now, first=now)
 
 fail_counts = defaultdict(int)
 
-import time
-import threading
-from collections import Counter
-import shutil
-
-
-class CLIHistogram:
-    def __init__(self, bins, minval, maxval, width=50, char='▇'):
-        self.bins = bins
-        self.minval = minval
-        self.maxval = maxval
-        self.width = width
-        self.char = char
-        self.counts = [0]*bins
-        self.lock = threading.Lock()
-
-    def add(self, val):
-        with self.lock:
-            if val < self.minval:
-                idx = 0
-            elif val >= self.maxval:
-                idx = self.bins-1
-            else:
-                idx = int((val - self.minval) / (self.maxval - self.minval) * self.bins)
-            self.counts[idx] += 1
-
-    def print(self):
-        with self.lock:
-            maxcount = max(self.counts) if self.counts else 1
-            cols = shutil.get_terminal_size((80,20)).columns
-            bar_max = min(self.width, cols - 20)
-            for i, c in enumerate(self.counts):
-                bar_len = int(c / maxcount * bar_max)
-                lo = self.minval + (self.maxval - self.minval) * (i / self.bins)
-                hi = self.minval + (self.maxval - self.minval) * ((i+1) / self.bins)
-                print(f"{lo:6.2f}-{hi:6.2f} | {self.char * bar_len} ({c})")
-
-histo = CLIHistogram(24,0.5,1.1)
+from stats import *
+from histo import CLIHistogram
+histo = CLIHistogram(12,0.7,1.0)
 
 class Action:
     def __init__(self,to_move=None, which_move=None):
         self.to_move = to_move
         self.which_move = which_move
         self.kg_query_format = [to_move,which_move]
+
+def delete_tree(root):
+    if root.is_leaf:
+        if hasattr(root,'until_depth'):
+            del root.until_depth;
+        if hasattr(root,'parent'):
+            root.parent = None
+        if hasattr(root,'xdata'):
+            del root.xdata
+        if hasattr(root,'board'):
+            del root.board
+        if hasattr(root,'action'):
+            del root.action
+        if hasattr(root,'id'):
+            del root.id
+        if hasattr(root,'query'):
+            del root.query
+        if hasattr(root,'balance'):
+            del root.balance
+    for k,v in root.children.items():
+        if v is not None:
+            assert isinstance(v,Node)
+            delete_tree(v)
+    del root.children
+    if hasattr(root,'taboo_list'):
+        del root.taboo_list
+
 class Node:
-    def __init__(self, xdata, board, id, parent=None, parent_query = None, action=None):
-        self.xdata = xdata
+    def __init__(self, board, id, parent=None, parent_query = None, action=None,xdata=None):
         self.board = board
         self.action = action
-        self.taboo_list = []
+        self.taboo_list = []    #XXX: deprecated, just delete the corresponding child entry(?)
         self.id = id
         if parent is None:
+            self.relevant_player = xdata['relevant_player']
+            self.passes = deepcopy(xdata['passes'])
             assert parent_query is not None
+            self.until_depth=dict()
+            if 'B' != parent_query['avoidMoves'][0]['player']:
+                parent_query['avoidMoves'][0],parent_query['avoidMoves'][1] = parent_query['avoidMoves'][1],parent_query['avoidMoves'][0]
+            assert 'B' == parent_query['avoidMoves'][0]['player']
+            self.until_depth['B'] = parent_query['avoidMoves'][0]['untilDepth']
+            self.until_depth['W'] = parent_query['avoidMoves'][1]['untilDepth']
             self.query = parent_query
             self.parent = self
             self.to_move = xdata['relevant_player']
-            self.depth=0
-            self.pass_audit = dict(B=0,W=0)
             self.last_good_node = None
+
+            comp,ref = xdata['comp'],xdata['ref']
+            either = set([comp]).union(ref)
+            self.either = either
+            self.comp = comp
+            self.ref = ref
         else:
+            self.passes = deepcopy(parent.passes)
+            self.until_depth = deepcopy(parent.until_depth)
             self.parent = parent
-            self.pass_audit = deepcopy(parent.pass_audit)
-            self.query = deepcopy(parent.query)
             self.to_move = xchg_color[parent.to_move]
             self.balance = deepcopy(parent.balance)
             if action:
                 self.balance[action.to_move] += 1
             else:
-                self.pass_audit[parent.to_move] += 1
-#            if self.pass_audit['B'] == self.xdata['passes']['B'] and self.pass_audit['W'] == self.xdata['passes']['W'] and self.get_root().xdata['relevant_player']:
-#                print(f" found possibly terminal node. checking versus condition: {self.is_terminal}")
-            self.update_query(action)
-            self.depth = parent.depth + int(action is not None)
+                self.passes[parent.to_move] -= 1
+                assert self.passes[parent.to_move] >= 0
+            self.until_depth['B'] = max (0, self.until_depth['B'] - 1)
+            self.until_depth['W'] = max (0, self.until_depth['W'] - 1)
+            if action is None:
+                pass
+            else:
+                self.board.play(*mvv(action.which_move,19),action.to_move.lower())
+                assert self.to_move == xchg_color[action.to_move]
+            a = self.until_depth['B']
+            b = self.until_depth['W']
+            rv = np.random.rand()
+            if self.is_balanced and (max(a,b) > 0) and self.get_root().random_drop and rv < 2.0/(a+b) and len(self.parent.children) < K_BUDGET:
+                self.parent.children[(mkid(), 'pass' if action is None else action.which_move)] = None  # XXX
+                self.until_depth['B'] = 0
+                self.until_depth['W'] = 0
         self.visits = 0
         self._outcome = 0
         self.children = dict()
@@ -129,53 +154,26 @@ class Node:
         while not node.is_root:
             node = node.parent
         return node
-    def initial_context(self):
-        return self.get_root().query['initialStones']
 
-    def update_query(self,action):
-        self.query['id'] = mkid()
-        self.query['initialPlayer'] = self.to_move
-        if action is None:
-            pass
-        else:
-            self.board.play(*mvv(action.which_move,19),action.to_move.lower())
-            assert self.to_move == xchg_color[action.to_move]
-        if self.is_move_node:
-            if 'avoidMoves' in self.query:
-                self.query['avoidMoves'][0]['untilDepth'] = max (1, self.query['avoidMoves'][0]['untilDepth'] - 1)
-                self.query['avoidMoves'][1]['untilDepth'] = max (1, self.query['avoidMoves'][1]['untilDepth'] - 1)
-                a = self.query['avoidMoves'][0]['untilDepth']
-                b = self.query['avoidMoves'][1]['untilDepth']
-                if a<=1 and b<=1:
-                    del self.query['avoidMoves']
-                elif self.get_root().random_drop and ((np.random.rand() < 1.0/a) and (len(self.parent.children) < K_BUDGET)):
-                    del self.query['avoidMoves']
-#                    print(f"added short-circuit node")
-                    self.parent.children[(mkid(), 'pass' if action is None else action.which_move)] = None
-        self.query['initialStones'] = _list_oc(self.board)
 
     @property
     def is_root(self):
         return self.parent == self
 
-    @cached_property
-    def is_move_node(self):
-        return self.is_balanced
-
-    @property
-    def is_setup_node(self):
-        return not self.is_move_node
 
     @cached_property
     def is_viable(self):
-        if self.is_balanced and self.to_move == self.get_root().xdata['relevant_player']:
+        if self.is_balanced and self.to_move == self.get_root().relevant_player:
             self.get_root().last_good_node = self
+            assert self.passes['W'] == 0 and self.passes['B'] == 0
             return True
         return False
 
     @cached_property
     def is_terminal(self):
-        if self.is_viable and 'avoidMoves' not in self.query.keys():
+        a = self.until_depth['B']
+        b = self.until_depth['W']
+        if self.is_viable and max(a,b) == 0:
             return True
         else:
             return False
@@ -186,39 +184,33 @@ class Node:
 
     @cached_property
     def is_balanced(self):
-        match self.to_move:
-            case 'B':
-                return self.balance['B'] == self.balance['W']
-            case 'W':
-                return self.balance['B'] == (self.balance['W'] + 1)
+        return self.balance['B'] == (self.balance['W'] + parity_player[self.to_move])
 
+    def get_updated_query(self):
+        action = self.action
+        query = deepcopy(self.get_root().query)
+        query['id'] = mkid()
+        query['initialPlayer'] = self.to_move
+        if self.is_balanced and 'avoidMoves' in query:
+            query['avoidMoves'][0]['untilDepth'] = self.until_depth['B']
+            query['avoidMoves'][1]['untilDepth'] = self.until_depth['W']
+            if self.until_depth['B'] == 0 and self.until_depth['W'] == 0:
+                del query['avoidMoves']
+        query['initialStones'] = _list_oc(self.board)
+        return query
 
     def dump_sgf(self,gain,penalty,self_winrate,pvs=None,name=None):
         d=defaultdict(list)
-        for z in self.query['initialStones']:
+        query=self.get_updated_query()
+        for z in query['initialStones']:
             d[z[0]].append(mvv(z[1], 19))
         u=sgf.Sgf_game(19);
         r=u.get_root()
         r.set_setup_stones(d["B"],d["W"],[])
         r.add_comment_text(f"gain: {gain} penalty: {penalty} self_winrate: {self_winrate}")
-        r.set('KM',self.query['komi'])
-        r.set('TR',[mvv(self.xdata['comp'],19)])
-#        if pvs:
-#            a=u.extend_main_sequence()
-#            color = self.xdata['relevant_player']
-#            assert pvs[0][0] in self.either
-#            for vertex in pvs[0]:
-#                a.set_move(color.lower(), mvv(vertex,19))
-#                color = xchg_color[color]
-#            for pv in pvs[1:]:
-#                assert pv[0] in self.either
-#                color = self.xdata['relevant_player']
-#                c = u.get_root().new_child()
-#                for vertex in pv:
-#                    c.set_move(color.lower(),mvv(vertex,19))
-#                    color = xchg_color[color]
-#                    c = c.new_child()
-        pathname = f'output/{self.query['id'] if name is None else name}.sgf'
+        r.set('KM',query['komi'])
+        r.set('TR',[mvv(self.get_root().comp,19)])
+        pathname = f'output/{query['id'] if name is None else name}.sgf'
         with open(pathname,'wb') as f:
             f.write(u.serialise())
         print(f"dumped {pathname} ({gain}, penalty {penalty} winrate {self_winrate})")
@@ -226,92 +218,110 @@ class Node:
     def __getitem__(self,child):
         return self.children[child]
     def __setitem__(self,child,value):
-        self.children[child] = value
+        self.children[child] = value    #XXX
+
+    def mk_outcome_query(self,num_visits=TERMINAL_VISITS):
+        query = self.get_updated_query()
+        query['maxVisits'] = num_visits
+        query['analysisPVLen'] = OUTCOME_PVLEN
+        query['initialPlayer'] = self.get_root().relevant_player
+        return query
+
+    def parse_outcome_query(self,full_output):
+        winrate = full_output['rootInfo']['winrate']
+        moveInfos = sorted(full_output['moveInfos'],key=lambda x:x['order'])
+        r=self.get_root()
+        either,comp = r.either,r.comp
+        moveInfos_dict = { m['move']:m for m in moveInfos }
+        pvs = [ moveInfos_dict[k]['pv'] for k in moveInfos_dict if k in either]
+        pvks = [(k, moveInfos_dict[k]['pv']) for k in moveInfos_dict if k in either]
+        evaluable_node = comp in moveInfos_dict
+        is_solution = (comp == moveInfos[0]['move'])
+        return dict(winrate=winrate,
+                    MI=moveInfos,
+                    MID=moveInfos_dict,
+                    pvs=pvs,
+                    pvks=pvks,
+                    evaluable_node=evaluable_node,
+                    is_solution = is_solution)
+    def _outcome_from_parsed(self,parsed):
+        winrate_regularizer = winrate_lambda * (parsed['winrate'] - 0.5)**2
+        r=self.get_root()
+        either,comp,ref = r.either,r.comp,r.ref
+        cmi = parsed['MID'][comp]
+        l = list(parsed['MID'][k]['winrate'] for k in parsed['MID'] if k in either)
+        mu = 0 if len(l) == 0 else np.max(l)
+        ref_visits = sum(parsed['MID'][x]['visits'] for x in ref if x in parsed['MID'])
+        visits_vs_ref = (cmi['visits'] / (cmi['visits'] + ref_visits))
+        winrate_vs_ref = cmi['winrate'] - mu
+        outcome_vs_ref = winrate_weight*winrate_vs_ref + visit_weight * visits_vs_ref
+        outcome_vs_order = ((len(parsed['MI']) - cmi['order']) / len(parsed['MI']))
+        outcome = hard_outcome_weight*outcome_vs_order + soft_outcome_weight*outcome_vs_ref
+
+        outcome_r = outcome - winrate_regularizer
+        #this kind of "cheating" just distorts the evaluations too much; it is better
+        #to shape the reward appropriately so that order == 0 in a natural way gets
+        #a very high reward. Otherwise what seems to happen is that the winrate is all over
+        #the place in a way it isn't if we just find solutions naturally without this type of
+        #nudge.
+        #outcome_r = (np.random.uniform()*1e-6+bests[-1]['value']) if parsed['is_solution'] else outcome_r
+        return outcome,winrate_regularizer,outcome_r
+
+    def _report_trigger(self,outcome_r,winrate,is_solution=None):
+        if is_solution:
+            prev_sol = solutions[-1]
+            solutions.append(dict())
+            solutions[-1]['num_solution'] = prev_sol['num_solution'] + 1
+            solutions[-1]['node'] = self
+            solutions[-1]['value'] = outcome_r
+            name = f"solution_{solutions[-1]['num_solution']}_{winrate:.3f}"
+        else:
+            prev_best = bests[-1]
+            bests.append(dict())
+            bests[-1]['num_best'] = prev_best['num_best'] + 1
+            bests[-1]['node'] = self
+            bests[-1]['value'] = outcome_r
+            name = f"best_{bests[-1]['num_best']}_{winrate:.3f}"
+        return name
 
     @property
-    def outcome(self,num_visits=1600):
+    def outcome(self,num_visits=TERMINAL_VISITS):
         if self._outcome:
             return self._outcome
         assert self.is_viable
-#######################
         katago = self.get_root().katago
-        query = deepcopy(self.query)
-        query['maxVisits'] = num_visits
-        query['analysisPVLen'] = 8
-        query['initialPlayer'] = self.xdata['relevant_player']
-        self.full_output = katago.query_raw(query)
-        self.winrate = self.full_output['rootInfo']['winrate']
-        winrate_regularizer = 0.1 * (self.winrate - 0.5)**2
-        #winrate_regularizer = 0.25 * (self.winrate - self.get_root().winrate)**2
-        moveInfos = self.full_output['moveInfos']
-        moveInfos = sorted(moveInfos, key=lambda x:x['order'])
-        moveInfos_lcb = sorted(moveInfos, key=lambda x:x['utilityLcb'])
-        lcb_range = moveInfos_lcb[0]['utilityLcb'] - moveInfos_lcb[-1]['utilityLcb']
-        moveInfos_dict = { m['move']:m for m in moveInfos }
-        assert moveInfos[0]['order'] == 0
-#        best_score = moveInfos[0]['utilityLcb']
-#######################
-        comp,ref = self.xdata['comp'],self.xdata['ref']
-        either = set([comp]).union(ref)
-        self.either = either
-        if comp not in moveInfos_dict:
+        qy = self.mk_outcome_query(num_visits)
+        self.full_output = katago.query_raw(self.mk_outcome_query(num_visits))
+        parsed = self.parse_outcome_query(self.full_output)
+        self.winrate = parsed['winrate']
+        if not parsed['evaluable_node']:
             outcome = outcome_r = 0
         else:
-            cmi = moveInfos_dict[comp]
-#            print(f" either = {either}")
-#            pvs = [ moveInfos_dict[k]['pv'] for k in moveInfos_dict if k in either]
-#            pvks = [(k, moveInfos_dict[k]['pv']) for k in moveInfos_dict if k in either]
-#            print(f"pvks = {pvks}")
-            l = list(moveInfos_dict[k]['winrate'] for k in moveInfos_dict if k in either)
-            #lcb_ = moveInfos_dict[comp]['utilityLcb']
-            mu = 0 if len(l) == 0 else np.max(l)
-            #outcome = 0.5*(lcb_ - mu)/lcb_range
-            ref_visits = sum(moveInfos_dict[x]['visits'] for x in ref if x in moveInfos_dict)
-            outcome_vs_ref1 = (cmi['visits'] / (cmi['visits'] + ref_visits))
-            outcome_vs_ref2 = cmi['winrate'] - mu
-            outcome_vs_ref = 0.7*outcome_vs_ref2 + 0.3 * outcome_vs_ref1
-            outcome_vs_order = ((len(moveInfos) - cmi['order']) / len(moveInfos))**2
-            outcome = 0.8*outcome_vs_order + 0.2*outcome_vs_ref
+            outcome,winrate_regularizer,outcome_r = self._outcome_from_parsed(parsed)
 
-            outcome_r = outcome - winrate_regularizer
+            if outcome_r > bests[-1]['value'] or parsed['is_solution']:
 
-            if outcome_r > bests[-1]['value'] or moveInfos[0]['move'] == comp:
-
-                if moveInfos[0]['move'] == comp:
-                    prev_sol = solutions[-1]
-                    solutions.append(dict())
-                    solutions[-1]['num_solution'] = prev_sol['num_solution'] + 1
-                    solutions[-1]['node'] = self
-                    solutions[-1]['value'] = outcome_r
-                    name = f"solution_{solutions[-1]['num_solution']}_{self.winrate:.3f}"
-                else:
-                    prev_best = bests[-1]
-                    bests.append(dict())
-                    bests[-1]['num_best'] = prev_best['num_best'] + 1
-                    bests[-1]['node'] = self
-                    bests[-1]['value'] = outcome_r
-                    name = f"best_{bests[-1]['num_best']}_{self.winrate:.3f}"
-
+                name = self._report_trigger(outcome_r,
+                                            self.winrate,
+                                            is_solution = parsed['is_solution'])
                 self.dump_sgf(outcome, winrate_regularizer, self.winrate, pvs = None, name=name)
         self._outcome = outcome_r
+        self._histo_trigger(timestamp(),outcome_r)
+        return outcome_r
+    def _histo_trigger(self,now, outcome_r, max_delta=20):
         leaf_statistics['count'] += 1
         count = leaf_statistics['count']
-        last = leaf_statistics['last']
-        now = timestamp()
         histo.add(outcome_r)
-        if now - last > 20:
+        last_histo = leaf_statistics['last_histo']
+        if now - last_histo > max_delta:
             print(f"{count} evals, {count/(now - leaf_statistics['first'])} per second")
-            leaf_statistics['last'] = now
+            leaf_statistics['last_histo'] = now
             histo.print()
-        return outcome_r
-
     def get_tabooed_visits(self):
-        s = sum(self.children[c].visits for c in self.children if c not in self.taboo_list and self.children[c])
+        if len(self.taboo_list) == 0:
+            return self.visits
+        s = sum(self.children[c].get_tabooed_visits() for c in self.children if c not in self.taboo_list and self.children[c])
         return max(1,s)
-#    def get_tabooed_q_value(self):
-#        tabooed_visits = self.get_tabooed_visits()
-#        s = sum(self.children[c].q_value for c in self.children if c not in self.taboo_list)
-#        return s
 
     def _child_values(self):
         tabooed_visits = self.get_tabooed_visits()
@@ -324,6 +334,11 @@ class Node:
                 mu = node.q_value / (1 + node.get_tabooed_visits())
                 denominator = 1 + node.visits
             return (mu,denominator)
+        if len(self.taboo_list) > 0:
+            print(self.taboo_list)
+            print(self.children.keys())
+        for child in self.children:
+            assert child not in self.taboo_list
         return [(child, arf(child)) for child in self.children if child not in self.taboo_list ]
     def select(self,k_budget=K_BUDGET,loss_thr=0.3,type='random'):
         if len(self.children) == 0:
@@ -355,7 +370,8 @@ class Node:
     def apply(self):
         w=None
         v=None
-        for i in range(8):
+        n=64
+        for i in range(n):
             try:
                 v = self.tree_policy();
             except TreePolicyException as e:
@@ -375,22 +391,23 @@ class Node:
             if w:
                 w.backprop();
                 return (True,None)
+            else:
+                print(f" {i}/{n}")
         return (False, v)
 
     def expand(self,child):
-        xdata = deepcopy(self.xdata)
         if child[1] == 'pass':
             action = None
-            xdata['passes'][self.to_move] -= 1
-            assert xdata['passes']['B'] >= 0
-            assert xdata['passes']['W'] >= 0
         else:
             action = Action(to_move=self.to_move,which_move=child[1])
 
         board_ =self.board.copy()
-        node = Node(xdata,board_,child, parent=self,action=action)
+        node = Node(board_,child, parent=self,action=action,xdata=None)
         self[child]=node
         node._build_child_nodes()
+        if all(x is not None for x in self.children.values()):
+            del self.board
+            self.board = None
     def default_policy(self,maxdepth = D_BUDGET):
         depth = 0
         node = self
@@ -399,12 +416,8 @@ class Node:
         while not node.is_terminal:
             depth +=1
             if depth >= maxdepth:
-                frac = default_policy_stats['success'] / default_policy_stats['tries']
-                mh = node.move_history()
-                blacks = [ x[1] for x in mh if x is not None and x[0] == 'B']
-                whites = [ x[1] for x in mh if x is not None and x[0] == 'W']
+#                frac = default_policy_stats['success'] / default_policy_stats['tries']
 #                print(f"exceeded depth budget (depth >= {maxdepth}) ({frac} success rate), bailing")
-#                print(f"move history was {mh} (#B = {len(blacks)}, #W = {len(whites)})")
                 last_good_node = self.get_root().last_good_node
                 if last_good_node and last_good_node.is_ancestor(self):
                     return last_good_node
@@ -427,13 +440,13 @@ class Node:
             assert node == self
         default_policy_stats['success'] += 1
         return node
-    def _get_candidate_moves(self,k_budget,loss_thr,num_visits=20):
+    def _get_candidate_moves(self,k_budget,loss_thr,num_visits=CANDIDATE_VISITS):
         katago = self.get_root().katago
-        query = deepcopy(self.query)
+        query = self.get_updated_query()
         query['maxVisits'] = num_visits
         if self.is_root:
             print(f"using many visits for root node")
-            query['maxVisits'] = 3200
+            query['maxVisits'] = ROOT_VISITS
         #query['maxVisits'] = num_visits
         output = self.candidate_output = katago.query_raw(query)
         self.query_output = output
@@ -444,7 +457,7 @@ class Node:
         tops = top_k(output['moveInfos'],k_budget)
         best_score = tops[0]['scoreMean']
         moves = [ x['move'] for x in tops if x['scoreMean'] - best_score < loss_thr]
-        if self.xdata['passes'][self.to_move] > 0:
+        if self.passes[self.to_move] > 0:
             assert 'pass' not in moves
             moves.append('pass')
         forbidden = self.get_root().forbidden_vertices
@@ -454,39 +467,33 @@ class Node:
             raise BorkException
         self.candidate_moves = moves
         self.candidate_pvs = { k:self.output_dict[k]['pv'] for k in moves if k != 'pass'}
-#        uu = self.candidate_pvs
-#        uu = [ x for x in uu if 0 == len(set(uu).intersection(forbidden)) ]
-#        dist1 = sorted([f"{len(x)}" for x in self.candidate_pvs])
-#        dist2 = sorted([f"{len(x)}" for x in uu])
-#        print(f"{" ".join(dist1)} ({" ".join(dist2)}) ")
         if self.is_root:
             print(f"root node got {len(moves)} number of moves")
         return moves
     def place_taboo(self):
+        print("placing taboo")
         self.parent.taboo_list.append(self.id)
         node = self.parent
         while len(node.children) == len(node.taboo_list):
-            for x in node.taboo_list:
-                assert x in node.children
+            assert all(x in node.children for x in node.taboo_list)
             node.parent.taboo_list.append(node.id)
             node = node.parent
-#            print(f"recursed in place_taboo")
-    def _build_child_nodes(self,k_budget=8,loss_thr=0.3):
+            print(f"recursing in place_taboo")
+    def _build_child_nodes(self,k_budget=8,loss_thr=LOSS_THRESHOLD):
         assert self.is_leaf
         moves = self._get_candidate_moves(k_budget,loss_thr)
         for move in moves:
             self.children[(mkid(), move)] = None
     def backprop(self):
-        self.get_root().katago
         assert self.is_viable
         delta_vp = self.outcome
         node = self
         while True:
-            id = node.query['id']
             node.visits += 1
             node.q_value += delta_vp
             if node.is_root:
                 break
             node = node.parent
+
 
 
