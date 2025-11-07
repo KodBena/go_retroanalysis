@@ -340,7 +340,7 @@ class Node:
         for child in self.children:
             assert child not in self.taboo_list
         return [(child, arf(child)) for child in self.children if child not in self.taboo_list ]
-    def select(self,k_budget=K_BUDGET,loss_thr=0.3,type='random'):
+    def select(self,k_budget=K_BUDGET,loss_thr=LOSS_THRESHOLD,type='random'):
         if len(self.children) == 0:
             self._build_child_nodes(k_budget=k_budget,loss_thr=loss_thr)
         match type:
